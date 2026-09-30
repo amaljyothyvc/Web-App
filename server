@@ -1,0 +1,210 @@
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const Database = require("better-sqlite3");
+const rateLimit = require("express-rate-limit");
+require("dotenv").config();
+const app = express();
+const db = new Database("jobs.db");
+app.set("trust proxy", 1);
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:5173", 
+  credentials: true
+}));
+
+app.use(express.json());
+
+// 3. Global Rate Limiter: Prevents general endpoint spamming (Max 100 requests per 15 mins)
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 100, 
+  message: { error: "Too many requests from this IP, please try again later." },
+  standardHeaders: true, 
+  legacyHeaders: false, 
+});
+
+// 4. Strict Rate Limiter: Limits company account/API key creation (Max 5 per hour per IP)
+const strictCreationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, 
+  max: 5, 
+  message: { error: "Company creation limit reached. Please try again in an hour." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/", generalLimiter); 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS companies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_name TEXT NOT NULL,
+    company_email TEXT,
+    company_website TEXT,
+    location TEXT,
+    apiKey TEXT UNIQUE NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    job_title TEXT NOT NULL,
+    location TEXT,
+    experience TEXT,
+    salary TEXT,
+    skills TEXT,
+    description TEXT,
+    deadline TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (company_id) REFERENCES companies (id)
+  )
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    applied_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (job_id) REFERENCES jobs (id)
+  )
+`).run();
+
+// ==========================================
+// 🏢 COMPANIES ENDPOINT
+// ==========================================
+
+// Create a company — Rate limited to prevent database flooding/bloat attacks
+app.post("/api/companies", strictCreationLimiter, (req, res) => {
+  const { company_name, company_email, company_website, location } = req.body;
+
+  if (!company_name) {
+    return res.status(400).json({ error: "company_name is required" });
+  }
+
+  const apiKey = crypto.randomBytes(24).toString("hex");
+
+  const result = db.prepare(`
+    INSERT INTO companies (company_name, company_email, company_website, location, apiKey)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(company_name, company_email, company_website, location, apiKey);
+
+  res.status(201).json({
+    company: {
+      id: result.lastInsertRowid,
+      company_name,
+      company_email,
+      company_website,
+      location
+    },
+    apiKey
+  });
+});
+app.post("/api/jobs", (req, res) => {
+  const apiKey = req.headers["x-api-key"];
+
+  if (!apiKey) {
+    return res.status(401).json({ error: "Missing API key" });
+  }
+
+  const company = db.prepare(`SELECT id FROM companies WHERE apiKey = ?`).get(apiKey);
+
+  if (!company) {
+    return res.status(401).json({ error: "Invalid API key" });
+  }
+
+  const { job_title, location, experience, salary, skills, description, deadline } = req.body;
+
+  if (!job_title) {
+    return res.status(400).json({ error: "job_title is required" });
+  }
+
+  const result = db.prepare(`
+    INSERT INTO jobs
+    (company_id, job_title, location, experience, salary, skills, description, deadline)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(company.id, job_title, location, experience, salary, skills, description, deadline);
+
+  res.status(201).json({
+    message: "Job created successfully",
+    jobId: result.lastInsertRowid
+  });
+});
+app.get("/api/jobs", (req, res) => {
+  const jobs = db.prepare(`
+    SELECT 
+      jobs.id, 
+      jobs.job_title, 
+      jobs.location, 
+      jobs.experience, 
+      jobs.salary, 
+      jobs.skills, 
+      jobs.description, 
+      jobs.deadline, 
+      jobs.created_at,
+      companies.company_name
+    FROM jobs
+    JOIN companies ON jobs.company_id = companies.id
+    ORDER BY jobs.id DESC
+  `).all();
+
+  res.json(jobs);
+});
+app.post("/api/applications", (req, res) => {
+  const { job_id } = req.body;
+
+  if (!job_id) {
+    return res.status(400).json({ error: "job_id is required" });
+  }
+
+  const job = db.prepare(`SELECT id FROM jobs WHERE id = ?`).get(job_id);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  db.prepare(`INSERT INTO applications (job_id) VALUES (?)`).run(job_id);
+
+  res.status(201).json({ message: "Application recorded" });
+});
+app.get("/api/applications/stats", (req, res) => {
+  const apiKey = req.headers["x-api-key"];
+
+  if (!apiKey) {
+    return res.status(401).json({ error: "Missing API key to view stats" });
+  }
+
+  const company = db.prepare(`SELECT id FROM companies WHERE apiKey = ?`).get(apiKey);
+  if (!company) {
+    return res.status(401).json({ error: "Invalid API key" });
+  }
+
+  
+  const today = db.prepare(`
+    SELECT COUNT(applications.id) as count FROM applications
+    JOIN jobs ON applications.job_id = jobs.id
+    WHERE jobs.company_id = ? AND date(applications.applied_at) = date('now')
+  `).get(company.id).count;
+
+  const thisWeek = db.prepare(`
+    SELECT COUNT(applications.id) as count FROM applications
+    JOIN jobs ON applications.job_id = jobs.id
+    WHERE jobs.company_id = ? AND date(applications.applied_at) >= date('now', 'weekday 0', '-6 days')
+  `).get(company.id).count;
+
+  const thisMonth = db.prepare(`
+    SELECT COUNT(applications.id) as count FROM applications
+    JOIN jobs ON applications.job_id = jobs.id
+    WHERE jobs.company_id = ? AND strftime('%Y-%m', applications.applied_at) = strftime('%Y-%m', 'now')
+  `).get(company.id).count;
+
+  const thisYear = db.prepare(`
+    SELECT COUNT(applications.id) as count FROM applications
+    JOIN jobs ON applications.job_id = jobs.id
+    WHERE jobs.company_id = ? AND strftime('%Y', applications.applied_at) = strftime('%Y', 'now')
+  `).get(company.id).count;
+
+  res.json({ today, thisWeek, thisMonth, thisYear });
+});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running securely on port ${PORT}`);
+});
