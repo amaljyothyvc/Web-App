@@ -1,0 +1,88 @@
+import { useState } from 'react';
+
+function CompanyForm({ onClose, onRegistered }) {
+  const [company, setCompany] = useState({
+    company_name: "",
+    company_email: "",
+    company_website: "",
+    location: ""
+  });
+
+  function handleChange(e) {
+    setCompany({
+      ...company,
+      [e.target.name]: e.target.value
+    });
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+
+    const response = await fetch("http://localhost:3000/api/companies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(company)
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      alert(`Error: ${err.error}`);
+      return;
+    }
+
+    const data = await response.json();
+
+    // Save the key so PostJob can read it later
+    localStorage.setItem('companyApiKey', data.apiKey);
+
+    alert(`Company registered! Your API key is: ${data.apiKey}\nKeep this safe — you'll need it to post jobs.`);
+
+    // Tell the parent registration succeeded, so it can switch to PostJob
+    onRegistered();
+  }
+
+  return (
+    <div className="company-form-screen">
+      <div className="company-form">
+        <h2>Register Your Company</h2>
+        <form onSubmit={handleSubmit}>
+          <input
+            type="text"
+            name="company_name"
+            placeholder="Company Name"
+            value={company.company_name}
+            onChange={handleChange}
+          />
+          <input
+            type="email"
+            name="company_email"
+            placeholder="Company Email"
+            value={company.company_email}
+            onChange={handleChange}
+          />
+          <input
+            type="url"
+            name="company_website"
+            placeholder="Company Website"
+            value={company.company_website}
+            onChange={handleChange}
+          />
+          <input
+            type="text"
+            name="location"
+            placeholder="Location"
+            value={company.location}
+            onChange={handleChange}
+          />
+          <button type="submit">
+            Register Company
+          </button>
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+export default CompanyForm
